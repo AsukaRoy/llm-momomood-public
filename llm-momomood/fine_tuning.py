@@ -2,11 +2,15 @@
 import os
 import ast
 import random
+import glob
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["BNB_CUDA_VERSION"] = "118"
-os.environ['HF_HOME']='/m/cs/scratch/networks-nima-mmm2018/yunhao/model/'
+
+# os.environ["BNB_CUDA_VERSION"] = "118"
+#os.environ['HF_HOME']='/m/cs/scratch/networks-nima-mmm2018/yunhao/model/'
+print(f'HF home directory is {os.environ['HF_HOME']}')
+#os.environ['HF_HOME']='/scratch/shareddata/dldata/huggingface-hub-cache/'
 import logging
 from typing import List, Tuple, Dict
 from datetime import datetime
@@ -16,13 +20,15 @@ from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
 from datasets import Dataset
 from peft import LoraConfig, PeftConfig
-from trl import SFTTrainer, setup_chat_format
+from trl import SFTTrainer, setup_chat_format, SFTConfig
+
 from transformers import (AutoModelForCausalLM,
                           AutoTokenizer,
                           BitsAndBytesConfig,
                           TrainingArguments,
-                          pipeline)
-
+                          pipeline,
+                          DataCollatorForSeq2Seq)
+from transformers import AutoConfig
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 from sklearn.metrics import classification_report
@@ -37,6 +43,11 @@ from datasets import load_dataset
 import fire
 import json
 import numpy as np
+
+print(torch.cuda.is_available())
+print(torch.cuda.device_count())
+print(torch.cuda.current_device())
+print(torch.cuda.get_device_name(torch.cuda.current_device()))
 
 
 def set_global_seed(seed_variant):
@@ -58,35 +69,52 @@ INPUT: The input contains the following contents: data about mobile phone usage 
 OUTPUT: To determine how the user's mental health state changes, you should only respond with "Label: Remains" or "Label: More Depressed" or "Label: Less Depressed". Make sure to only return the label and nothing more.
 """
 
-# -- No EVAL -- #
-# -- training mode: 'full' ; 'embedding' ; 'cls' -- #
 
-def construct_prompt(user_data, n_shot_examples):
-    """Constructs a chat-like prompt given user data and optional few-shot examples."""
-    messages = [{"role": "system",
-                 "content": SYSTEM_PROMPT}]
 
-    for example in n_shot_examples:
-        messages.append({"role": "user", "content": example['data']})
-        messages.append({"role": "assistant", "content": f'Label: {example["label"]} \n'})
+def construct_prompt(user_data, n_shot_examples=None):
+    """Constructs a Mistral-compatible training prompt without system role."""
+    messages = []
+    
+    # Add system prompt as first user message if provided
+    messages.append({"role": "user", "content": f"Instructions: {SYSTEM_PROMPT}\n\nPlease follow these instructions."})
+    messages.append({"role": "assistant", "content": "I understand."})
+    
+    # Add few-shot examples
+    if n_shot_examples:
+        for example in n_shot_examples:
+            messages.append({"role": "user", "content": example['data']})
+            messages.append({"role": "assistant", "content": f'Label: {example["label"]}\n'})
+    
+    # Add current data point with its label (for training)
     messages.append({"role": "user", "content": user_data['data']})
-    messages.append({"role": "assistant", "content": f'Label: {user_data["label"]} \n'})
+    messages.append({"role": "assistant", "content": f'Label: {user_data["label"]}\n'})
+    
     return messages
 
-def construct_test_prompt(user_data, n_shot_examples):
-    """Constructs a chat-like prompt given user data and optional few-shot examples."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for example in n_shot_examples:
-        messages.append({"role": "user", "content": example['data']})
-        messages.append({"role": "assistant", "content": f'Label: {example["label"]} \n'})
-    messages.append({"role": "user", "content": user_data['data']})
 
+def construct_test_prompt(user_data, n_shot_examples=None):
+    """Constructs a Mistral-compatible test prompt without system role."""
+    messages = []
+    
+    # Add system prompt as first user message if provided
+
+    messages.append({"role": "user", "content": f"Instructions: {SYSTEM_PROMPT}\n\nPlease follow these instructions."})
+    messages.append({"role": "assistant", "content": "I understand."})
+
+    # Add few-shot examples
+    if n_shot_examples:
+        for example in n_shot_examples:
+            messages.append({"role": "user", "content": example['data']})
+            messages.append({"role": "assistant", "content": f'Label: {example["label"]}\n'})
+    
+    # Add current data point without label (for inference)
+    messages.append({"role": "user", "content": user_data['data']})
+    
     return messages
+
 
 def select_n_shot_examples(df, label, original_example, n=0):
     """Select n-shot examples from the dataframe based on the label."""
-    # if n==0:
-    #     return df.sample(n=0, replace=False).to_dict('records')
     filtered_df = df[(df['previous depression state'] == label) & (df['data'] != original_example['data'])]
     examples = filtered_df.sample(n=n, replace=False).to_dict('records')
     return examples
@@ -101,6 +129,15 @@ def load_data(filename: str, prompt_style: str, seed_variant: int, n_shot=0) -> 
         data = 'data_with_history'
     elif prompt_style == 'with_init_history':
         data = 'data_with_init_his'
+    elif prompt_style == 'Basic':
+        data = "Basic"
+    elif prompt_style == 'Health_Information':
+        data = "Health_Informtion"
+    elif prompt_style == 'Statistics':
+        data = "Statistics"
+    elif prompt_style == 'All':
+        data = "All"
+
 
     logging.info(f"load the datasets")
     df =  pd.read_csv(filename)
@@ -179,22 +216,44 @@ def process_prediction(prediction, prompt):
 
 
 def predict(test, model, tokenizer, y_true_text_label):
+
+        # Fix dtype mismatch for Qwen3 models
+    #if hasattr(model, 'lm_head') and model.lm_head.weight.dtype != torch.bfloat16:
+    #    model.lm_head = model.lm_head.to(torch.bfloat16)
+
+
     text_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
+        torch_dtype=torch.bfloat16
     )
+    
+    # Gemma 3 specific EOS tokens - adjust based on actual model configuration
     terminators = [
-            text_pipeline.tokenizer.eos_token_id,
-            text_pipeline.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        ]
+        text_pipeline.tokenizer.eos_token_id,
+    ]
+    
+    # Try to get Gemma 3 specific tokens if they exist
+    if hasattr(text_pipeline.tokenizer, 'convert_tokens_to_ids'):
+        try:
+            # Common Gemma end tokens - adjust based on actual tokenizer
+            end_tokens = ["<end_of_turn>", "<|end_of_text|>", "</s>"]
+            for token in end_tokens:
+                token_id = text_pipeline.tokenizer.convert_tokens_to_ids(token)
+                if token_id is not None and token_id != text_pipeline.tokenizer.unk_token_id:
+                    terminators.append(token_id)
+        except:
+            pass
+    
     y_true, y_preds = [], []
     for index, row in test.iterrows():
         messages = row['data']
         prompt = text_pipeline.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
-                add_generation_prompt=True
+                add_generation_prompt=True,
+                #enable_thinking=False
         )
         print('-----------------------------------------------------------')
         print(prompt)
@@ -202,8 +261,6 @@ def predict(test, model, tokenizer, y_true_text_label):
             prompt,
             max_new_tokens=16,
             eos_token_id=terminators,
-            do_sample=False,
-            temperature = 0.1,
             pad_token_id=text_pipeline.tokenizer.eos_token_id
         )
 
@@ -214,7 +271,7 @@ def predict(test, model, tokenizer, y_true_text_label):
 
         print("LLM answer: {} True Label: {} \n".format(generation[0]['generated_text'][len(prompt):], y_true_text_label[index]))
         print('-----------------------------------------------------------')
-     
+
         if y_true_text_label[index] == 'Remains':
             true_label = 0
         elif y_true_text_label[index] == 'More Depressed':
@@ -240,7 +297,7 @@ def split_data(df, subject_column, label_column, seed_variant, oversample = Fals
     - X_train (DataFrame): Training data subset.
     - X_test (DataFrame): Testing data subset.
     """
-    # Split subjects into training and test 
+    # Split subjects into training and test
     gss = GroupShuffleSplit(test_size=0.4, n_splits=1, random_state=1*seed_variant)
     train_idx, test_idx = next(gss.split(df, groups=df[subject_column]))
     X_train = df.iloc[train_idx]
@@ -285,14 +342,12 @@ def setup_trainer(model: AutoModelForCausalLM, tokenizer: AutoTokenizer,
     """
 
     trainer = None
-    
+
     if mode == 'embedding':
-        training_arguments = TrainingArguments(
+        training_arguments = SFTConfig(
             output_dir=output_model_dir,                    # directory to save and repository id
             num_train_epochs=1,                       # number of training epochs
             per_device_train_batch_size=1,
-            # per_device_eval_batch_size=1,            # batch size per device during training
-            # eval_accumulation_steps=1,
             gradient_accumulation_steps=4,            # number of steps before performing a backward/update pass
             gradient_checkpointing=False,             # use gradient checkpointing to save memory
             optim="adamw_torch",
@@ -301,16 +356,20 @@ def setup_trainer(model: AutoModelForCausalLM, tokenizer: AutoTokenizer,
             learning_rate=float(learning_rate),
             weight_decay=0.001,
             fp16=False,
-            bf16=False,
+            bf16=True,  # Enable bfloat16 for consistency
             max_grad_norm=0.3,                        # max gradient norm based on QLoRA paper
             max_steps=-1,
             warmup_ratio=0.03,                        # warmup ratio based on QLoRA paper
             group_by_length=False,
             lr_scheduler_type="cosine",               # use cosine learning rate scheduler
-            save_strategy="no", 
-            # eval_strategy="steps",
-            # eval_steps=40,                            # evaluate every 40 steps
-            seed=42*seed_variant
+            save_strategy="no",
+            seed=42*seed_variant,
+            dataset_text_field="data",
+            dataset_kwargs={
+                "add_special_tokens": False,
+                "append_concat_token": False,
+            },
+            packing=False,
         )
 
 
@@ -318,15 +377,6 @@ def setup_trainer(model: AutoModelForCausalLM, tokenizer: AutoTokenizer,
             model=model,
             args=training_arguments,
             train_dataset=train_data,
-            # eval_dataset=eval_data,
-            dataset_text_field="data",
-            tokenizer=tokenizer,
-            #max_seq_length=max_seq_length,
-            packing=False,
-            dataset_kwargs={
-                "add_special_tokens": False,
-                "append_concat_token": False,
-            },     
         )
 
     elif mode == 'full':
@@ -339,48 +389,40 @@ def setup_trainer(model: AutoModelForCausalLM, tokenizer: AutoTokenizer,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj",],
         )
-        training_arguments = TrainingArguments(
+        training_arguments = SFTConfig(
             output_dir=output_model_dir,                    # directory to save and repository id
             num_train_epochs=1,                       # number of training epochs
             per_device_train_batch_size=1,
-            # per_device_eval_batch_size=1,            # batch size per device during training
-            # eval_accumulation_steps=1,
             gradient_accumulation_steps=4,            # number of steps before performing a backward/update pass
             gradient_checkpointing=False,             # use gradient checkpointing to save memory
             optim="paged_adamw_32bit",
             save_steps=0,
-            logging_steps=10,                         # log every 10 steps                                                
+            logging_steps=10,                         # log every 10 steps
             learning_rate=float(learning_rate),
             weight_decay=0.001,
             fp16=False,
-            bf16=False,
+            bf16=True,  # Enable bfloat16 for consistency
             max_grad_norm=0.3,                        # max gradient norm based on QLoRA paper
             max_steps=-1,
             warmup_ratio=0.03,                        # warmup ratio based on QLoRA paper
             group_by_length=False,
             lr_scheduler_type="cosine",               # use cosine learning rate scheduler
             save_strategy="no",
-            # eval_strategy="steps",
-            # eval_steps=40,                            # evaluate every 40 steps
-            seed=42*seed_variant
-        )
-        trainer = SFTTrainer(
-            model=model,
-            args=training_arguments,
-            train_dataset=train_data,
-            # eval_dataset=eval_data,
-            peft_config=peft_config,
+            seed=42*seed_variant,
             dataset_text_field="data",
-            tokenizer=tokenizer,
-            #max_seq_length=max_seq_length,
             packing=False,
             dataset_kwargs={
                 "add_special_tokens": False,
                 "append_concat_token": False,
             },
-            
         )
-    
+        trainer = SFTTrainer(
+            model=model,
+            args=training_arguments,
+            train_dataset=train_data,
+            peft_config=peft_config,
+        )
+
     return trainer
 
 def setup_model_and_tokenizer(model_path: str, mode: str):
@@ -401,30 +443,123 @@ def setup_model_and_tokenizer(model_path: str, mode: str):
     logging.info(f"HF_HOME {os.environ['HF_HOME']} ends")
 
     if mode == 'full':
-        compute_dtype = getattr(torch, "float16")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=False,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map=device,
-        torch_dtype=compute_dtype,
-        quantization_config=bnb_config,)
+        print(f"Model path: {model_path}")
+        compute_dtype = getattr(torch, "bfloat16")
+        # Special handling for Qwen3 models
+        if 'Qwen3' in model_path or 'qwen3' in model_path.lower():
+            
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=False,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_quant_storage=compute_dtype,  # Add this for Qwen3
+            )
+            
+            # Load with specific config for Qwen3
+            config = AutoConfig.from_pretrained(model_path)
+            config.pretraining_tp = 1  # Important for Qwen3
+            if hasattr(config, 'tensor_parallel_size'):
+                config.tensor_parallel_size = 1
+                
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                device_map=device,
+                torch_dtype=compute_dtype,
+                quantization_config=bnb_config
+            )
+            if hasattr(model, "lm_head"):
+                # Keep lm_head in FP32 (matches many Qwen3 execution paths)
+                model.lm_head = model.lm_head.to(torch.float32)
+        
+                # Safety hook: cast hidden_states to lm_head.weight.dtype at runtime
+                def _align_dtype_pre_hook(module, inputs):
+                    (hidden_states,) = inputs
+                    if hidden_states.dtype != module.weight.dtype:
+                        hidden_states = hidden_states.to(module.weight.dtype)
+                    return (hidden_states,)
+            model.lm_head.register_forward_pre_hook(_align_dtype_pre_hook)
+        else:
+            compute_dtype = getattr(torch, "bfloat16")
+            # Original configuration for other models
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=False,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map=device,
+                torch_dtype=compute_dtype,
+                quantization_config=bnb_config,
+            )
+                # Apply dtype alignment hook to lm_head for all models
+            if hasattr(model, "lm_head"):
+                def _align_dtype_pre_hook(module, inputs):
+                    (hidden_states,) = inputs
+                    if hidden_states.dtype != module.weight.dtype:
+                        hidden_states = hidden_states.to(module.weight.dtype)
+                    return (hidden_states,)
+        
+            model.lm_head.register_forward_pre_hook(_align_dtype_pre_hook)
+
 
     elif mode == 'embedding':
+        print(f"Model path: {model_path}")
 
+        compute_dtype = getattr(torch, "bfloat16")
+        
+        
+        config = AutoConfig.from_pretrained(model_path)
+        # Disable any tensor parallel related config
+        if hasattr(config, 'tensor_parallel_size'):
+            config.tensor_parallel_size = 1
+        if hasattr(config, 'pretraining_tp'):
+            config.pretraining_tp = 1
+            
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            device_map=device,
+            config=config,
+            torch_dtype=compute_dtype,
+            device_map={"": 0},
         )
+        
+        
         for param in model.parameters():
             param.requires_grad = False
+            
+        if hasattr(model.model, 'embed_tokens'):
+            for param in model.model.embed_tokens.parameters():
+                param.requires_grad = True
+                print('param.requires_grad = True')
+        elif hasattr(model.model, 'embeddings'):
+            for param in model.model.embeddings.parameters():
+                param.requires_grad = True
+                print('param.requires_grad = True')
+        elif hasattr(model, 'embed_tokens'):
+            for param in model.embed_tokens.parameters():
+                param.requires_grad = True
+                print('param.requires_grad = True')
+        elif hasattr(model.model.language_model, 'embed_tokens'):
+            for param in model.model.language_model.embed_tokens.parameters():
+                param.requires_grad = True
+                print('param.requires_grad = True')
+                # freeze all but embeddings
+        if('Qwen' in model_path):
+            for p in model.parameters(): 
+                p.requires_grad = False
+            # Qwen3 embeddings live here:
+            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                for p in model.model.embed_tokens.parameters(): 
+                    p.requires_grad = True
+
+
+    
         # unfreeze embedding layer
-        for param in model.model.embed_tokens.parameters():
-            param.requires_grad = True
+        #for param in model.model.embed_tokens.parameters():
+        #    param.requires_grad = True
         # unfreeze classification head
         # for param in model.score.parameters():
         #     param.requires_grad = True
@@ -432,7 +567,7 @@ def setup_model_and_tokenizer(model_path: str, mode: str):
     model.config.use_cache = False
     model.config.pretraining_tp = 1
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, device_map="auto")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, device_map="auto")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, tokenizer
@@ -454,6 +589,50 @@ def log_time_info(message: str):
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     logger.info(f"{message} at {current_time}")
 
+
+def check_results_exist(output_result_path, feature, prompt_style, mode):
+    """
+    Check if results for the given configuration already exist.
+    
+    Args:
+        output_result_path (str): Path to the output directory
+        feature (str): Feature name
+        prompt_style (str): Prompt style
+        mode (str): Training mode
+        force_rerun (bool): If True, ignore existing results and rerun
+    
+    Returns:
+        bool: True if results exist and should be skipped, False otherwise
+    """
+    
+    # Check for existing JSON files matching the pattern
+    pattern = f"{output_result_path}/fine_tuning_{mode}_{feature}_{prompt_style}_*.json"
+    existing_files = glob.glob(pattern)
+    
+    if existing_files:
+        logger.info(f"Found existing results for {mode}_{feature}_{prompt_style}: {len(existing_files)} files")
+        logger.info(f"Files found: {[os.path.basename(f) for f in existing_files]}")
+        
+        # Check if the most recent file is valid (not corrupted)
+        most_recent = max(existing_files, key=os.path.getctime)
+        try:
+            with open(most_recent, 'r') as f:
+                data = json.load(f)
+                # Basic validation - check if it has expected keys
+                if 'Accuracy' in data and 'Macro F1' in data:
+                    logger.info(f"Valid results found in {os.path.basename(most_recent)}. Skipping...")
+                    return True
+                else:
+                    logger.warning(f"Existing file {os.path.basename(most_recent)} appears incomplete. Will rerun.")
+                    return False
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            logger.warning(f"Error reading existing file {os.path.basename(most_recent)}: {e}. Will rerun.")
+            return False
+    else:
+        logger.info(f"No existing results found for {mode}_{feature}_{prompt_style}")
+        return False
+
+
 def main(data_path: str,
          model_path:str,
          output_result_path: str,
@@ -464,19 +643,23 @@ def main(data_path: str,
          prompt_style: str = 'original',
          seed_variant: int = 1
         ):
-    
+
     set_global_seed(seed_variant)
     log_time_info("Starting main function, seed: {}".format(seed_variant*42))
 
-    log_time_info(f"hypeparameter info: prompt style: {prompt_style}, feature: {feature}, learning rate: {learning_rate}")
-
+    log_time_info(f"hypeparameter info: prompt style: {prompt_style}, feature: {feature}, learning rate: {learning_rate}, Model_path: {model_path}, seed: {seed_variant}, mode: {mode}")
+    if check_results_exist(output_result_path, feature, prompt_style, mode):
+        logger.info(f"Skipping {output_result_path} {mode}_{feature}_{prompt_style} - results already exist")
+        return
     model, tokenizer = setup_model_and_tokenizer(model_path, mode)
+    logger.info(f"model: {model}")
     log_time_info("Model and tokenizer setup completed")
 
     X_train, X_test, y_true_text_label = load_data(data_path, prompt_style, seed_variant, n_shot = 0)
     log_time_info("Data loading completed, seed: {}".format(seed_variant*1))
 
     train_data = Dataset.from_pandas(X_train)
+    #train_data = train_data.map(lambda x: {"data": tokenizer.apply_chat_template(x["data"], tokenize=False, add_generation_prompt=True, enable_thinking=False)})
     train_data = train_data.map(lambda x: {"data": tokenizer.apply_chat_template(x["data"], tokenize=False, add_generation_prompt=True)})
     print_gpu_info()
 

@@ -9,6 +9,4 @@ Under `data` folder, there are 4 sets of prompts available. The filenames are se
 
 ## Run inference
 
-This project uses the llama-3.1 8b. Inference is implemented in `fine_tuning_llama3_phq.py`. 
-
-A bash script is ready for use (look into `run.sh`). Run it on Triton using the command `sbatch run.sh`. 
+under script file
